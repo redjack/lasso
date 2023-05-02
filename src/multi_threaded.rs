@@ -334,7 +334,8 @@ where
                 Some(v) => *v.get(),
                 None => {
                     // Safety: The drop impl removes all references before the arena is dropped
-                    let string: &'static str = unsafe { self.arena.store_str(string_slice)? };
+                    let string: &'static str =
+                        unsafe { self.arena.lock().unwrap().store_str(string_slice)? };
 
                     let key = K::try_from_usize(self.key.fetch_add(1, Ordering::SeqCst))
                         .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
