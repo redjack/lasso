@@ -14,7 +14,7 @@ use core::{
     ops::Index,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry, SharedValue};
 use hashbrown::{hash_map::RawEntryMut, HashMap};
 use std::sync::Mutex;
 
@@ -322,22 +322,30 @@ where
         if let Some(key) = self.map.get(string_slice) {
             Ok(*key)
         } else {
-            // Safety: The drop impl removes all references before the arena is dropped
-            let string: &'static str =
-                unsafe { self.arena.lock().unwrap().store_str(string_slice)? };
+            // Determine which shard will have our `string_slice` key.
+            let shard_key = self.map.determine_shard(self.map.hash_usize(&string_slice));
+            // Grab the shard and a write lock on it.
+            let mut shard = self.map.shards().get(shard_key).unwrap().write();
+            // Try getting the value for the `string_slice` key. If we get `Some`, nothing to do. 
+            // Just return the value, which is the key go to use to resolve the string. If we 
+            // get `None`, an entry for the string doesn't exist yet. Store string in the arena
+            // and update the maps accordingly.
+            let key = match shard.get(string_slice) {
+                Some(v) => *v.get(),
+                None => {
+                    // Safety: The drop impl removes all references before the arena is dropped
+                    let string: &'static str = unsafe { self.arena.store_str(string_slice)? };
 
-            let make_new_key = || {
-                K::try_from_usize(self.key.fetch_add(1, Ordering::SeqCst))
-                    .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))
+                    let key = K::try_from_usize(self.key.fetch_add(1, Ordering::SeqCst))
+                        .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
+
+                    self.strings.insert(key, string);
+                    shard.insert(string, SharedValue::new(key));
+
+                    key
+                }
             };
-
-            let key = *self
-                .map
-                .entry(string)
-                .or_try_insert_with(make_new_key)?
-                .value();
-            self.strings.insert(key, string);
-
+            
             Ok(key)
         }
     }
@@ -399,17 +407,19 @@ where
         if let Some(key) = self.map.get(string) {
             Ok(*key)
         } else {
-            let make_new_key = || {
-                K::try_from_usize(self.key.fetch_add(1, Ordering::SeqCst))
-                    .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))
-            };
+            let key = match self.map.entry(string) {
+                Entry::Occupied(o) => {
+                    *o.get()
+                }
+                Entry::Vacant(v) => {
+                    let key = K::try_from_usize(self.key.fetch_add(1, Ordering::SeqCst))
+                        .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
+                    self.strings.insert(key, string);
+                    v.insert(key);
 
-            let key = *self
-                .map
-                .entry(string)
-                .or_try_insert_with(make_new_key)?
-                .value();
-            self.strings.insert(key, string);
+                    key
+                }
+            };
 
             Ok(key)
         }
